@@ -1,0 +1,96 @@
+x-app: &app
+  build: .
+  image: payments-service:local
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+  API_KEY: ${API_KEY:-dev-secret-key}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-app-depends: &app-depends
+  postgres:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+  migrations:
+    condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"  # management UI, guest/guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  migrations:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "payments.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on: *app-depends
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  outbox-relay:
+    <<: *app
+    command: ["python", "-m", "payments.workers.outbox_relay"]
+    environment: *app-env
+    depends_on: *app-depends
+    restart: unless-stopped
+
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "payments.workers.consumer:app"]
+    environment: *app-env
+    depends_on: *app-depends
+    restart: unless-stopped
+
+  # Demo-only receiver for webhook notifications.
+  webhook-receiver:
+    <<: *app
+    command: ["uvicorn", "payments.dev.webhook_receiver:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      WEBHOOK_RECEIVER_FAIL_RATE: ${WEBHOOK_RECEIVER_FAIL_RATE:-0.3}
+    ports:
+      - "8001:8001"
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
